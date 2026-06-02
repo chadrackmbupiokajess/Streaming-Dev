@@ -1,0 +1,36 @@
+# Dependency directories
+node_modules/
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database
+db.sqlite3
+
+# Environment variables
+.env
+.env.local
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# React build
+frontend/build/
+frontend/dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backend media/static
+static/
+media/
+d
