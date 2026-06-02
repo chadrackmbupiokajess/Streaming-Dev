@@ -1,91 +1,173 @@
-import React, { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { createFrameDisplayHandler } from '../utils/stream';
 
-const API_URL = 'http://localhost:8001/api';
 const WS_URL = 'ws://localhost:8001/ws';
 
 function ViewerPage() {
   const [selectedCam, setSelectedCam] = useState(null);
-  const wsRef = useRef(null);
+
+  const imgRef = useRef(null);
   const urlRef = useRef(null);
+  const streamWsRef = useRef(null);
+  const controlWsRef = useRef(null);
+  const selectedIdRef = useRef(null);
+  const reconnectTimerRef = useRef(null);
 
-  const checkSelection = async () => {
-    try {
-      const res = await axios.get(`${API_URL}/streams/current_selected/`);
-      if (res.data.camera_id !== selectedCam?.id) {
-        setSelectedCam({ id: res.data.camera_id, name: res.data.camera_name });
+  const closeStream = useCallback(() => {
+    if (streamWsRef.current) {
+      streamWsRef.current.close();
+      streamWsRef.current = null;
+    }
+    if (urlRef.current) {
+      URL.revokeObjectURL(urlRef.current);
+      urlRef.current = null;
+    }
+    if (imgRef.current) {
+      imgRef.current.removeAttribute('src');
+    }
+  }, []);
+
+  const openStream = useCallback(
+    (cameraId) => {
+      closeStream();
+
+      const ws = new WebSocket(`${WS_URL}/stream/${cameraId}/`);
+      ws.binaryType = 'arraybuffer';
+
+      const onFrame = createFrameDisplayHandler(() => imgRef.current, urlRef);
+      ws.onmessage = onFrame;
+      streamWsRef.current = ws;
+    },
+    [closeStream]
+  );
+
+  const applySelection = useCallback(
+    (cameraId, cameraName) => {
+      const id = cameraId != null && cameraId !== '' ? Number(cameraId) : null;
+
+      if (id === selectedIdRef.current) {
+        return;
       }
-    } catch (e) {
-      setSelectedCam(null);
+
+      selectedIdRef.current = id;
+
+      if (!id) {
+        setSelectedCam(null);
+        closeStream();
+        return;
+      }
+
+      const name = cameraName || `Source ${id}`;
+      setSelectedCam({ id, name });
+      openStream(id);
+    },
+    [closeStream, openStream]
+  );
+
+  const connectControlSocket = useCallback(() => {
+    if (controlWsRef.current?.readyState === WebSocket.OPEN) {
+      return;
     }
-  };
 
-  useEffect(() => {
-    checkSelection();
-    const interval = setInterval(checkSelection, 3000);
-    return () => clearInterval(interval);
-  }, [selectedCam]);
+    const ctrl = new WebSocket(`${WS_URL}/viewer/`);
 
-  useEffect(() => {
-    if (selectedCam) {
-      if (wsRef.current) wsRef.current.close();
-
-      const ws = new WebSocket(`${WS_URL}/stream/${selectedCam.id}/`);
-      ws.binaryType = 'blob'; // Important: mode binaire activé
-
-      ws.onmessage = (event) => {
-        const imgElement = document.getElementById('viewer-img');
-        if (!imgElement) return;
-
-        // Nettoyage de la mémoire (URL précédente)
-        if (urlRef.current) {
-          URL.revokeObjectURL(urlRef.current);
+    ctrl.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'selection_changed') {
+          applySelection(data.camera_id, data.camera_name);
         }
+      } catch (e) {
+        console.warn('viewer ws:', e);
+      }
+    };
 
-        // Création de l'URL d'image à partir du Blob binaire
-        const url = URL.createObjectURL(event.data);
-        imgElement.src = url;
-        urlRef.current = url;
-      };
+    ctrl.onclose = () => {
+      controlWsRef.current = null;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+      }
+      reconnectTimerRef.current = setTimeout(connectControlSocket, 800);
+    };
 
-      ws.onclose = () => console.log("Déconnecté du stream");
-      wsRef.current = ws;
-    }
+    controlWsRef.current = ctrl;
+  }, [applySelection]);
+
+  useEffect(() => {
+    connectControlSocket();
 
     return () => {
-        if (wsRef.current) wsRef.current.close();
-        if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+      }
+      if (controlWsRef.current) {
+        controlWsRef.current.close();
+        controlWsRef.current = null;
+      }
+      closeStream();
     };
-  }, [selectedCam]);
+  }, [connectControlSocket, closeStream]);
 
   return (
     <div className="container" style={{ textAlign: 'center' }}>
       <header style={{ marginBottom: '2rem', color: 'white' }}>
         <h1>Espace Spectateur</h1>
-        <p>Réception directe haute performance</p>
+        <p>Synchronisation WebSocket instantanée avec la régie</p>
       </header>
 
       {selectedCam ? (
-        <div className="card" style={{ maxWidth: '750px', margin: '0 auto', padding: '0', overflow: 'hidden', boxShadow: '0 10px 30px rgba(0,0,0,0.5)' }}>
-          <div style={{ padding: '12px', background: '#e74c3c', color: 'white', fontWeight: 'bold' }}>
-            🔴 EN DIRECT : {selectedCam.name}
+        <div
+          className="card"
+          style={{
+            maxWidth: '750px',
+            margin: '0 auto',
+            padding: 0,
+            overflow: 'hidden',
+            boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
+          }}
+        >
+          <div
+            style={{
+              padding: '12px',
+              background: '#e74c3c',
+              color: 'white',
+              fontWeight: 'bold',
+            }}
+          >
+            EN DIRECT : {selectedCam.name}
           </div>
 
           <img
-            id="viewer-img"
-            alt="Réception du flux..."
-            style={{ width: '100%', height: 'auto', minHeight: '300px', background: '#000', display: 'block' }}
+            ref={imgRef}
+            alt="Réception du flux"
+            style={{
+              width: '100%',
+              height: 'auto',
+              minHeight: '300px',
+              background: '#000',
+              display: 'block',
+              objectFit: 'contain',
+            }}
           />
 
-          <div style={{ padding: '15px', background: '#f8f9fa', color: '#666', fontSize: '0.8rem' }}>
-            Technologie HighSpeed Binary (Zéro Latence)
+          <div
+            style={{
+              padding: '15px',
+              background: '#f8f9fa',
+              color: '#666',
+              fontSize: '0.8rem',
+            }}
+          >
+            Bascule en temps réel via WebSocket
           </div>
         </div>
       ) : (
         <div className="card" style={{ maxWidth: '500px', margin: '50px auto', padding: '3rem' }}>
           <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>📺</div>
           <h3>Aucune diffusion active</h3>
-          <p style={{ color: '#888' }}>L'administrateur n'a pas encore sélectionné de caméra.</p>
+          <p style={{ color: '#888' }}>
+            En attente du choix de l&apos;administrateur…
+          </p>
         </div>
       )}
     </div>
