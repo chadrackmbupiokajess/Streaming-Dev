@@ -74,6 +74,33 @@ function useWebRtcStream(cameraId) {
         setStatus('live');
       };
 
+      peer.oniceconnectionstatechange = () => {
+        if (disposed) {
+          return;
+        }
+
+        if (
+          peer.iceConnectionState === 'checking' ||
+          peer.iceConnectionState === 'connected' ||
+          peer.iceConnectionState === 'completed'
+        ) {
+          setStatus(
+            peer.iceConnectionState === 'checking' ? 'ice-check' : 'live'
+          );
+        } else if (
+          peer.iceConnectionState === 'failed' ||
+          peer.iceConnectionState === 'disconnected'
+        ) {
+          setStatus('ice-failed');
+        }
+      };
+
+      peer.onicecandidateerror = () => {
+        if (!disposed) {
+          setStatus('ice-error');
+        }
+      };
+
       peer.onicecandidate = (event) => {
         if (!event.candidate || !sourceIdRef.current) {
           return;
@@ -92,6 +119,8 @@ function useWebRtcStream(cameraId) {
 
         if (peer.connectionState === 'connected') {
           setStatus('live');
+        } else if (peer.connectionState === 'connecting') {
+          setStatus('connecting-peer');
         } else if (
           peer.connectionState === 'failed' ||
           peer.connectionState === 'disconnected'
@@ -148,14 +177,15 @@ function useWebRtcStream(cameraId) {
 
           if (data.type === 'webrtc_offer') {
             const sourceId = data.sender_id || data.source_id;
-            if (!sourceId || !data.sdp) {
-              return;
-            }
+          if (!sourceId || !data.sdp) {
+            return;
+          }
 
-            const peer = ensurePeer(sourceId);
-            await peer.setRemoteDescription({ type: 'offer', sdp: data.sdp });
-            await flushPendingCandidates(peer);
-            const answer = await peer.createAnswer();
+          const peer = ensurePeer(sourceId);
+          setStatus('negotiating');
+          await peer.setRemoteDescription({ type: 'offer', sdp: data.sdp });
+          await flushPendingCandidates(peer);
+          const answer = await peer.createAnswer();
             await peer.setLocalDescription(answer);
             sendSignal({
               type: 'webrtc_answer',

@@ -23,6 +23,7 @@ private behind nginx.
 - `bootstrap.sh`: first install helper, from clone/pull to running app
 - `install_services.sh`: installs the `systemd` service and nginx site
 - `deploy.sh`: update script for later deployments
+- `setup_coturn.sh`: optional TURN server install for production WebRTC
 
 ## Recommended first install
 
@@ -85,6 +86,58 @@ sudo certbot --nginx -d stream.bisofood.com
 
 HTTPS is important here because browser camera access and WebRTC behavior are
 much better in a secure origin.
+
+## Production WebRTC
+
+The current stack uses WebRTC for video. In local development, STUN alone may
+appear to work. In production, especially when:
+
+- the source is on a phone
+- the regie is on another network
+- the spectator is on a third network
+
+STUN-only setups often fail because the peers cannot establish a direct media
+path through NAT or carrier-grade NAT.
+
+WebRTC and MDN both document that TURN is commonly required in production when
+direct peer-to-peer paths are not possible:
+
+- https://webrtc.org/getting-started/turn-server
+- https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Connectivity
+
+If the UI shows the source but the image stays on statuses such as
+`waiting-source`, `negotiating`, or `ice-failed`, install TURN.
+
+### Install coturn on the VPS
+
+After HTTPS is already active:
+
+```bash
+cd /srv/streaming-dev
+chmod +x deploy/vps/setup_coturn.sh
+
+DOMAIN=stream.bisofood.com \
+PUBLIC_IP=72.60.66.248 \
+TURN_USER=streamturn \
+TURN_PASSWORD=change-me-with-a-strong-password \
+deploy/vps/setup_coturn.sh
+```
+
+Then update `/srv/streaming-dev/deploy/vps/frontend.env`:
+
+```env
+REACT_APP_WEBRTC_ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":["turn:stream.bisofood.com:3478?transport=udp","turn:stream.bisofood.com:3478?transport=tcp","turns:stream.bisofood.com:5349?transport=tcp"],"username":"streamturn","credential":"change-me-with-a-strong-password"}]
+```
+
+Then redeploy:
+
+```bash
+cd /srv/streaming-dev
+APP_DIR=/srv/streaming-dev \
+APP_NAME=streaming-dev \
+BRANCH=main \
+deploy/vps/deploy.sh
+```
 
 ## GitHub access on a partner repo
 
