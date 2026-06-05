@@ -7,6 +7,8 @@ run on the same host.
 
 - `nginx` serves the React build on `stream.bisofood.com`
 - `nginx` proxies `/api/` and `/ws/` to a local Daphne process
+- React static assets stay on `/static/`
+- Django collected static assets are exposed on `/backend-static/`
 - Daphne listens only on `127.0.0.1:18001`
 - the backend runs as a `systemd` service
 - the frontend is built to static files under `/var/www/streaming-dev`

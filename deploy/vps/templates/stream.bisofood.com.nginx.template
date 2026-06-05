@@ -7,7 +7,7 @@ server {
     root __PUBLIC_ROOT__;
     index index.html;
 
-    location /static/ {
+    location /backend-static/ {
         alias __APP_DIR__/backend/staticfiles/;
         access_log off;
         expires 7d;
