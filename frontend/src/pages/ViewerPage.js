@@ -1,175 +1,280 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { createFrameDisplayHandler } from '../utils/stream';
-
-const WS_URL = 'ws://localhost:8001/ws';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { buildWsUrl } from '../config';
+import useAudioStream from '../hooks/useAudioStream';
+import useWebRtcStream from '../hooks/useWebRtcStream';
 
 function ViewerPage() {
   const [selectedCam, setSelectedCam] = useState(null);
+  const [selectedAudio, setSelectedAudio] = useState(null);
+  const [fadeClass, setFadeClass] = useState('');
+  const [isFocusMode, setIsFocusMode] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
-  const imgRef = useRef(null);
-  const urlRef = useRef(null);
-  const streamWsRef = useRef(null);
+  const stageRef = useRef(null);
   const controlWsRef = useRef(null);
   const selectedIdRef = useRef(null);
   const reconnectTimerRef = useRef(null);
+  const fadeTimerRef = useRef(null);
+  const shouldReconnectRef = useRef(true);
+  const videoMonitor = useWebRtcStream(selectedCam?.id);
+  const audioMonitor = useAudioStream(selectedAudio?.id, {
+    enabled: Boolean(selectedAudio?.id),
+  });
 
-  const closeStream = useCallback(() => {
-    if (streamWsRef.current) {
-      streamWsRef.current.close();
-      streamWsRef.current = null;
+  const runFadeEffect = useCallback((durationMs) => {
+    if (fadeTimerRef.current) {
+      clearTimeout(fadeTimerRef.current);
     }
-    if (urlRef.current) {
-      URL.revokeObjectURL(urlRef.current);
-      urlRef.current = null;
-    }
-    if (imgRef.current) {
-      imgRef.current.removeAttribute('src');
-    }
+    setFadeClass('viewer-fade-out');
+    fadeTimerRef.current = setTimeout(() => {
+      setFadeClass('viewer-fade-in');
+      fadeTimerRef.current = setTimeout(() => {
+        setFadeClass('');
+        fadeTimerRef.current = null;
+      }, durationMs);
+    }, Math.min(durationMs, 250));
   }, []);
 
-  const openStream = useCallback(
-    (cameraId) => {
-      closeStream();
-
-      const ws = new WebSocket(`${WS_URL}/stream/${cameraId}/`);
-      ws.binaryType = 'arraybuffer';
-
-      const onFrame = createFrameDisplayHandler(() => imgRef.current, urlRef);
-      ws.onmessage = onFrame;
-      streamWsRef.current = ws;
-    },
-    [closeStream]
-  );
-
   const applySelection = useCallback(
-    (cameraId, cameraName) => {
-      const id = cameraId != null && cameraId !== '' ? Number(cameraId) : null;
+    (cameraId, cameraName, transition = 'cut', durationMs = 0) => {
+      const id =
+        cameraId != null && cameraId !== '' && cameraId !== undefined
+          ? Number(cameraId)
+          : null;
 
       if (id === selectedIdRef.current) {
         return;
       }
 
+      const hadProgram = selectedIdRef.current != null;
       selectedIdRef.current = id;
 
       if (!id) {
+        setFadeClass('');
         setSelectedCam(null);
-        closeStream();
         return;
       }
 
-      const name = cameraName || `Source ${id}`;
-      setSelectedCam({ id, name });
-      openStream(id);
+      if (transition === 'fade' && durationMs > 0 && hadProgram) {
+        runFadeEffect(durationMs);
+      } else {
+        setFadeClass('');
+      }
+
+      setSelectedCam({
+        id,
+        name: cameraName || `Source ${id}`,
+      });
     },
-    [closeStream, openStream]
+    [runFadeEffect]
   );
 
   const connectControlSocket = useCallback(() => {
-    if (controlWsRef.current?.readyState === WebSocket.OPEN) {
+    if (
+      controlWsRef.current &&
+      (controlWsRef.current.readyState === WebSocket.OPEN ||
+        controlWsRef.current.readyState === WebSocket.CONNECTING)
+    ) {
       return;
     }
 
-    const ctrl = new WebSocket(`${WS_URL}/viewer/`);
+    const controlSocket = new WebSocket(buildWsUrl('/viewer/'));
 
-    ctrl.onmessage = (event) => {
+    controlSocket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
         if (data.type === 'selection_changed') {
-          applySelection(data.camera_id, data.camera_name);
+          applySelection(
+            data.camera_id,
+            data.camera_name,
+            data.transition || 'cut',
+            Number(data.duration_ms) || 0
+          );
+        } else if (data.type === 'audio_selection_changed') {
+          setSelectedAudio(
+            data.audio_source_id
+              ? {
+                  id: Number(data.audio_source_id),
+                  name: data.audio_source_name || `Audio ${data.audio_source_id}`,
+                }
+              : null
+          );
         }
-      } catch (e) {
-        console.warn('viewer ws:', e);
+      } catch (error) {
+        console.warn('viewer ws:', error);
       }
     };
 
-    ctrl.onclose = () => {
+    controlSocket.onclose = () => {
       controlWsRef.current = null;
+      if (!shouldReconnectRef.current) {
+        return;
+      }
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
       }
       reconnectTimerRef.current = setTimeout(connectControlSocket, 800);
     };
 
-    controlWsRef.current = ctrl;
+    controlWsRef.current = controlSocket;
   }, [applySelection]);
 
   useEffect(() => {
+    shouldReconnectRef.current = true;
     connectControlSocket();
 
     return () => {
+      shouldReconnectRef.current = false;
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
+      }
+      if (fadeTimerRef.current) {
+        clearTimeout(fadeTimerRef.current);
       }
       if (controlWsRef.current) {
         controlWsRef.current.close();
         controlWsRef.current = null;
       }
-      closeStream();
     };
-  }, [connectControlSocket, closeStream]);
+  }, [connectControlSocket]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    };
+
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFullscreenChange);
+    };
+  }, []);
+
+  const toggleFullscreen = async () => {
+    if (!stageRef.current) {
+      return;
+    }
+
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+        return;
+      }
+
+      await stageRef.current.requestFullscreen();
+    } catch (error) {
+      console.warn('fullscreen', error);
+    }
+  };
 
   return (
-    <div className="container" style={{ textAlign: 'center' }}>
-      <header style={{ marginBottom: '2rem', color: 'white' }}>
-        <h1>Espace Spectateur</h1>
-        <p>Synchronisation WebSocket instantanée avec la régie</p>
-      </header>
+    <div className="container">
+      <div className="page-shell">
+        {/* <section className="hero-panel">
+          <div className="hero-panel__grid">
+            <div>
+              <p className="hero-panel__eyebrow">Public Live Experience</p>
+              <h2>Le direct est accessible sans connexion, comme une vraie plateforme de streaming.</h2>
+              <p>
+                Cette page est la facade publique du MVP. Toute personne arrivant sur le site
+                voit immediatement le programme courant, pendant que la regie choisit les sources
+                en coulisses.
+              </p>
+              <div className="status-strip" style={{ marginTop: '1.1rem' }}>
+                <span className="signal-pill signal-pill--live">Live public</span>
+                <span className="soft-chip">
+                  <strong>{selectedCam ? `Video ${videoMonitor.status}` : 'Off-air'}</strong>
+                </span>
+                <span className="soft-chip">
+                  <strong>{selectedAudio ? 'Audio actif' : 'Audio off'}</strong>
+                </span>
+              </div>
+            </div>
 
-      {selectedCam ? (
-        <div
-          className="card"
-          style={{
-            maxWidth: '750px',
-            margin: '0 auto',
-            padding: 0,
-            overflow: 'hidden',
-            boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
-          }}
+            <div className="hero-side">
+              <div className="hero-metric">
+                <span className="hero-metric__label">Experience</span>
+                <div className="hero-metric__value">Instant play</div>
+                <p className="hero-metric__text">
+                  Le public arrive, regarde, et ne voit jamais la complexite de la regie.
+                </p>
+              </div>
+              <div className="hero-metric">
+                <span className="hero-metric__label">Mode image</span>
+                <div className="hero-metric__value">
+                  {isFullscreen ? 'Plein ecran' : isFocusMode ? 'Focus' : 'Standard'}
+                </div>
+              </div>
+            </div>
+          </div>
+        </section> */}
+
+        {audioMonitor.audioBlocked && selectedAudio && (
+          <div className="notice-banner">
+            <strong style={{ display: 'block', marginBottom: '0.35rem' }}>
+              Activation audio requise
+            </strong>
+            Le navigateur attend une interaction avant de lancer le son du direct.
+            <div className="action-row" style={{ marginTop: '0.85rem' }}>
+              <button type="button" onClick={audioMonitor.activateAudio}>
+                Activer l&apos;audio du live
+              </button>
+            </div>
+          </div>
+        )}
+
+        <section
+          ref={stageRef}
+          className={`card public-stage ${isFocusMode ? 'public-stage--focus' : ''}`}
         >
-          <div
-            style={{
-              padding: '12px',
-              background: '#e74c3c',
-              color: 'white',
-              fontWeight: 'bold',
-            }}
-          >
-            EN DIRECT : {selectedCam.name}
+          <div className="public-stage__header">
+            <div className="public-stage__title">
+              {/* <strong>{selectedCam ? selectedCam.name : 'Flux public en attente'}</strong> */}
+              <span>
+                {selectedCam
+                  ? 'Programme emis par la regie centrale'
+                  : 'Le direct demarrera des qu une source sera mise a l antenne'}
+              </span>
+            </div>
+            <div className="public-stage__actions">
+              <span className={`signal-pill ${selectedCam ? 'signal-pill--live' : ''}`}>
+                {selectedCam ? 'On air' : 'Standby'}
+              </span>
+              <button
+                type="button"
+                className="button-ghost public-stage__button"
+                onClick={() => setIsFocusMode((prev) => !prev)}
+              >
+                {isFocusMode ? 'Vue standard' : 'Agrandir'}
+              </button>
+              <button
+                type="button"
+                className="button-ghost public-stage__button"
+                onClick={toggleFullscreen}
+              >
+                {isFullscreen ? 'Quitter le plein ecran' : 'Plein ecran'}
+              </button>
+            </div>
           </div>
 
-          <img
-            ref={imgRef}
-            alt="Réception du flux"
-            style={{
-              width: '100%',
-              height: 'auto',
-              minHeight: '300px',
-              background: '#000',
-              display: 'block',
-              objectFit: 'contain',
-            }}
-          />
-
-          <div
-            style={{
-              padding: '15px',
-              background: '#f8f9fa',
-              color: '#666',
-              fontSize: '0.8rem',
-            }}
-          >
-            Bascule en temps réel via WebSocket
+          <div className={`public-stage__frame viewer-pgm ${fadeClass}`}>
+            {selectedCam ? (
+              <div className="public-stage__viewport">
+                <video
+                  ref={videoMonitor.videoRef}
+                  className="public-stage__canvas"
+                  autoPlay
+                  playsInline
+                  muted
+                />
+              </div>
+            ) : (
+              <div className="empty-panel" style={{ margin: '2rem' }}>
+                Aucun programme public n&apos;est diffuse pour le moment.
+              </div>
+            )}
           </div>
-        </div>
-      ) : (
-        <div className="card" style={{ maxWidth: '500px', margin: '50px auto', padding: '3rem' }}>
-          <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>📺</div>
-          <h3>Aucune diffusion active</h3>
-          <p style={{ color: '#888' }}>
-            En attente du choix de l&apos;administrateur…
-          </p>
-        </div>
-      )}
+        </section>
+      </div>
     </div>
   );
 }

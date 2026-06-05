@@ -1,54 +1,97 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import axios from 'axios';
+import React, { useCallback, useEffect, useState } from 'react';
+import { useAuth } from '../auth/AuthContext';
+import LiveAudioCard from '../components/LiveAudioCard';
 import LiveSourceCard from '../components/LiveSourceCard';
+import { API_URL } from '../config';
+import apiClient from '../lib/apiClient';
 
-const API_URL = 'http://localhost:8001/api';
 const STORAGE_SESSION = 'deviceId';
 
-async function cleanupStaleSessionCameras(sessionId) {
-  if (!sessionId) return;
-  try {
-    await axios.post(`${API_URL}/cameras/cleanup_session/`, { session_id: sessionId });
-  } catch (e) {
-    console.warn('cleanup_session', e);
+async function cleanupStaleEntries(sessionId) {
+  if (!sessionId) {
+    return;
   }
+
+  await Promise.allSettled([
+    apiClient.post(`${API_URL}/cameras/cleanup_session/`, { session_id: sessionId }),
+    apiClient.post(`${API_URL}/audio-sources/cleanup_session/`, {
+      session_id: `${sessionId}__audio`,
+    }),
+  ]);
+}
+
+function dedupeAudioDevices(devices) {
+  const filtered = devices.filter(
+    (device) => device.deviceId && device.deviceId !== 'communications'
+  );
+  const seen = new Set();
+
+  return filtered.filter((device) => {
+    const key = `${device.groupId || ''}:${device.label || device.deviceId}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 function CameraPage() {
+  const { user } = useAuth();
   const [videoDevices, setVideoDevices] = useState([]);
-  const [pickedDevices, setPickedDevices] = useState(() => new Set());
-  const [liveSources, setLiveSources] = useState([]);
+  const [audioDevices, setAudioDevices] = useState([]);
+  const [pickedVideoDevices, setPickedVideoDevices] = useState(() => new Set());
+  const [pickedAudioDevices, setPickedAudioDevices] = useState(() => new Set());
+  const [liveVideoSources, setLiveVideoSources] = useState([]);
+  const [liveAudioSources, setLiveAudioSources] = useState([]);
   const [sessionId, setSessionId] = useState('');
   const [deviceError, setDeviceError] = useState(null);
   const [loadingDevices, setLoadingDevices] = useState(true);
 
   const refreshDeviceList = useCallback(async () => {
     const devices = await navigator.mediaDevices.enumerateDevices();
-    const inputs = devices.filter((d) => d.kind === 'videoinput');
-    setVideoDevices(inputs);
-    return inputs;
+    const videoInputs = devices.filter((device) => device.kind === 'videoinput');
+    const audioInputs = dedupeAudioDevices(
+      devices.filter((device) => device.kind === 'audioinput')
+    );
+    setVideoDevices(videoInputs);
+    setAudioDevices(audioInputs);
   }, []);
 
   const initDevices = useCallback(async () => {
     setLoadingDevices(true);
     setDeviceError(null);
+
+    let permissionStream = null;
+
     try {
-      await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      permissionStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+
       await refreshDeviceList();
 
       let sid = localStorage.getItem(STORAGE_SESSION);
       if (!sid) {
-        sid = 'cam_' + Math.random().toString(36).substr(2, 9);
+        sid =
+          typeof crypto !== 'undefined' && crypto.randomUUID
+            ? `cam_${crypto.randomUUID()}`
+            : `cam_${Math.random().toString(36).slice(2, 11)}`;
         localStorage.setItem(STORAGE_SESSION, sid);
       }
+
       setSessionId(sid);
-      await cleanupStaleSessionCameras(sid);
-    } catch (err) {
-      console.error(err);
+      await cleanupStaleEntries(sid);
+    } catch (error) {
+      console.error(error);
       setDeviceError(
-        'Autorisez l\'accès à la caméra pour voir la liste (webcam, Iriun, OBS, etc.).'
+        "Autorisez l'acces a la camera et au micro pour publier des flux live."
       );
     } finally {
+      if (permissionStream) {
+        permissionStream.getTracks().forEach((track) => track.stop());
+      }
       setLoadingDevices(false);
     }
   }, [refreshDeviceList]);
@@ -60,219 +103,299 @@ function CameraPage() {
     return () => navigator.mediaDevices?.removeEventListener('devicechange', onDeviceChange);
   }, [initDevices, refreshDeviceList]);
 
-  const getDeviceLabel = (device, index) => {
-    if (device.label) return device.label;
-    return `Caméra ${index + 1}`;
-  };
+  const getVideoLabel = (device, index) => device?.label || `Camera ${index + 1}`;
+  const getAudioLabel = (device, index) => device?.label || `Micro ${index + 1}`;
 
-  const isDeviceLive = (deviceId) => liveSources.some((s) => s.deviceId === deviceId);
+  const liveVideoIds = new Set(liveVideoSources.map((source) => source.deviceId));
+  const liveAudioIds = new Set(liveAudioSources.map((source) => source.deviceId));
 
-  const togglePick = (deviceId) => {
-    if (isDeviceLive(deviceId)) return;
-    setPickedDevices((prev) => {
+  const togglePicked = (deviceId, type) => {
+    const liveIds = type === 'video' ? liveVideoIds : liveAudioIds;
+    const setter = type === 'video' ? setPickedVideoDevices : setPickedAudioDevices;
+
+    if (liveIds.has(deviceId)) {
+      return;
+    }
+
+    setter((prev) => {
       const next = new Set(prev);
-      if (next.has(deviceId)) next.delete(deviceId);
-      else next.add(deviceId);
+      if (next.has(deviceId)) {
+        next.delete(deviceId);
+      } else {
+        next.add(deviceId);
+      }
       return next;
     });
   };
 
-  const selectAll = () => {
-    const available = videoDevices
-      .map((d) => d.deviceId)
-      .filter((id) => !isDeviceLive(id));
-    setPickedDevices(new Set(available));
-  };
-
-  const clearPick = () => setPickedDevices(new Set());
-
-  const startSelectedStreams = () => {
-    const toAdd = [...pickedDevices].filter((id) => !isDeviceLive(id));
+  const launchSelectedVideos = () => {
+    const toAdd = [...pickedVideoDevices].filter((deviceId) => !liveVideoIds.has(deviceId));
     if (toAdd.length === 0) {
-      setDeviceError('Cochez au moins une source non diffusée.');
+      setDeviceError('Selectionnez au moins une source video libre.');
       return;
     }
-    setDeviceError(null);
-    cleanupStaleSessionCameras(sessionId);
 
+    setDeviceError(null);
     const newSources = toAdd.map((deviceId) => {
-      const device = videoDevices.find((d) => d.deviceId === deviceId);
-      const index = videoDevices.indexOf(device);
-      return {
-        deviceId,
-        label: getDeviceLabel(device, index),
-      };
+      const videoDevice = videoDevices.find((device) => device.deviceId === deviceId);
+      const index = videoDevices.indexOf(videoDevice);
+      return { deviceId, label: getVideoLabel(videoDevice, index) };
     });
 
-    setLiveSources((prev) => [...prev, ...newSources]);
-    setPickedDevices(new Set());
+    setLiveVideoSources((prev) => [...prev, ...newSources]);
+    setPickedVideoDevices(new Set());
   };
 
-  const stopSource = (deviceId) => {
-    setLiveSources((prev) => prev.filter((s) => s.deviceId !== deviceId));
-    setPickedDevices((prev) => {
+  const launchSelectedAudios = () => {
+    const toAdd = [...pickedAudioDevices].filter((deviceId) => !liveAudioIds.has(deviceId));
+    if (toAdd.length === 0) {
+      setDeviceError('Selectionnez au moins une source audio libre.');
+      return;
+    }
+
+    setDeviceError(null);
+    const newSources = toAdd.map((deviceId) => {
+      const audioDevice = audioDevices.find((device) => device.deviceId === deviceId);
+      const index = audioDevices.indexOf(audioDevice);
+      return { deviceId, label: getAudioLabel(audioDevice, index) };
+    });
+
+    setLiveAudioSources((prev) => [...prev, ...newSources]);
+    setPickedAudioDevices(new Set());
+  };
+
+  const stopVideoSource = useCallback((deviceId) => {
+    setLiveVideoSources((prev) => prev.filter((source) => source.deviceId !== deviceId));
+    setPickedVideoDevices((prev) => {
       const next = new Set(prev);
       next.delete(deviceId);
       return next;
     });
-  };
+  }, []);
 
-  const stopAll = () => {
-    setLiveSources([]);
-    setPickedDevices(new Set());
-  };
-
-  const hasLive = liveSources.length > 0;
-  const pickCount = pickedDevices.size;
+  const stopAudioSource = useCallback((deviceId) => {
+    setLiveAudioSources((prev) => prev.filter((source) => source.deviceId !== deviceId));
+    setPickedAudioDevices((prev) => {
+      const next = new Set(prev);
+      next.delete(deviceId);
+      return next;
+    });
+  }, []);
 
   return (
     <div className="container">
-      <div className="card" style={{ maxWidth: '720px', margin: '0 auto' }}>
-        <h3 style={{ marginBottom: '8px', textAlign: 'center' }}>
-          Studio — Sources multiples
-        </h3>
-        <p style={{ color: '#666', fontSize: '0.85rem', textAlign: 'center', marginBottom: '16px' }}>
-          Cochez une ou plusieurs entrées (webcam, Iriun, OBS…). L&apos;admin les verra toutes et
-          pourra basculer le direct.
-        </p>
+      <div className="page-shell">
+        <section className="hero-panel">
+          <div className="hero-panel__grid">
+            <div>
+              {/* <p className="hero-panel__eyebrow">Source Operator Workspace</p>
+              <h2>Publiez vos cameras et vos micros dans la plateforme live.</h2>
+              <p>
+                Cette console correspond a l'experience source du MVP SaaS. La regie
+                centrale peut ensuite choisir le meilleur flux video et le meilleur flux
+                audio pour alimenter la diffusion publique.
+              </p> */}
+              <div className="status-strip" style={{ marginTop: '1.1rem' }}>
+                <span className="soft-chip">
+                  <strong>{sessionId ? 'Session prete' : 'Session en cours'}</strong>
+                </span>
+                <span className="soft-chip">
+                  <strong>{liveVideoSources.length}</strong> video live
+                </span>
+                <span className="soft-chip">
+                  <strong>{liveAudioSources.length}</strong> audio live
+                </span>
+              </div>
+            </div>
 
-        <div style={{ display: 'flex', gap: '8px', marginBottom: '12px', flexWrap: 'wrap' }}>
-          <button
-            type="button"
-            onClick={selectAll}
-            disabled={loadingDevices || hasLive && videoDevices.length === liveSources.length}
-            style={{ padding: '6px 12px', fontSize: '0.85rem', background: '#667eea', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer' }}
-          >
-            Tout cocher
-          </button>
-          <button
-            type="button"
-            onClick={clearPick}
-            disabled={pickCount === 0}
-            style={{ padding: '6px 12px', fontSize: '0.85rem', background: '#888', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer' }}
-          >
-            Tout décocher
-          </button>
-          <button
-            type="button"
-            onClick={initDevices}
-            disabled={loadingDevices}
-            style={{ padding: '6px 12px', fontSize: '0.85rem', background: '#555', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer' }}
-          >
-            Actualiser la liste
-          </button>
-        </div>
+            <div className="hero-side">
+              <div className="hero-metric">
+                <span className="hero-metric__label">Compte source</span>
+                <div className="hero-metric__value">{user?.display_name || 'Operateur source'}</div>
+                <p className="hero-metric__text">
+                  Une source se connecte pour pousser un flux; le public regarde sans login.
+                </p>
+              </div>
+              <div className="hero-metric">
+                <span className="hero-metric__label">Console active</span>
+                <div className="hero-metric__value">
+                  {loadingDevices ? 'Scanning...' : `${videoDevices.length + audioDevices.length} devices`}
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
 
         {deviceError && (
-          <p style={{ color: '#e74c3c', fontSize: '0.9rem', marginBottom: '10px' }}>{deviceError}</p>
-        )}
-
-        <div
-          style={{
-            border: '1px solid #ddd',
-            borderRadius: '8px',
-            padding: '12px',
-            marginBottom: '16px',
-            maxHeight: '220px',
-            overflowY: 'auto',
-          }}
-        >
-          {loadingDevices && <p style={{ color: '#888' }}>Chargement des caméras…</p>}
-          {!loadingDevices && videoDevices.length === 0 && (
-            <p style={{ color: '#888' }}>Aucune caméra détectée.</p>
-          )}
-          {videoDevices.map((device, index) => {
-            const live = isDeviceLive(device.deviceId);
-            const picked = pickedDevices.has(device.deviceId);
-            return (
-              <label
-                key={device.deviceId}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '10px',
-                  padding: '8px 4px',
-                  cursor: live ? 'default' : 'pointer',
-                  borderBottom: '1px solid #eee',
-                  opacity: live ? 0.7 : 1,
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={live || picked}
-                  disabled={live}
-                  onChange={() => togglePick(device.deviceId)}
-                />
-                <span style={{ flex: 1 }}>{getDeviceLabel(device, index)}</span>
-                {live && (
-                  <span style={{ color: '#e74c3c', fontSize: '0.75rem', fontWeight: 'bold' }}>
-                    EN DIRECT
-                  </span>
-                )}
-              </label>
-            );
-          })}
-        </div>
-
-        <button
-          type="button"
-          onClick={startSelectedStreams}
-          disabled={loadingDevices || pickCount === 0 || !sessionId}
-          style={{
-            width: '100%',
-            padding: '14px',
-            background: '#27ae60',
-            color: 'white',
-            border: 'none',
-            borderRadius: '8px',
-            cursor: pickCount === 0 ? 'not-allowed' : 'pointer',
-            fontWeight: 'bold',
-            opacity: pickCount === 0 ? 0.6 : 1,
-            marginBottom: '10px',
-          }}
-        >
-          Lancer {pickCount > 1 ? `les ${pickCount} sources` : pickCount === 1 ? 'la source' : '…'}
-        </button>
-
-        {hasLive && (
-          <button
-            type="button"
-            onClick={stopAll}
-            style={{
-              width: '100%',
-              padding: '10px',
-              background: '#e74c3c',
-              color: 'white',
-              border: 'none',
-              borderRadius: '8px',
-              cursor: 'pointer',
-              fontWeight: 'bold',
-              marginBottom: '20px',
-            }}
-          >
-            Arrêter toutes les sources ({liveSources.length})
-          </button>
-        )}
-
-        {liveSources.length > 0 && (
-          <div
-            style={{
-              display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
-              gap: '16px',
-            }}
-          >
-            {liveSources.map((source) => (
-              <LiveSourceCard
-                key={source.deviceId}
-                deviceId={source.deviceId}
-                label={source.label}
-                sessionId={sessionId}
-                onStopped={stopSource}
-              />
-            ))}
+          <div className="notice-banner">
+            <strong style={{ display: 'block', marginBottom: '0.35rem' }}>
+              Action requise
+            </strong>
+            {deviceError}
           </div>
         )}
+
+        <div className="action-row">
+          <button type="button" className="button-secondary" onClick={initDevices} disabled={loadingDevices}>
+            Actualiser les peripheriques
+          </button>
+          <button
+            type="button"
+            className="button-ghost"
+            onClick={() => {
+              setPickedVideoDevices(new Set(videoDevices.map((device) => device.deviceId)));
+              setPickedAudioDevices(new Set(audioDevices.map((device) => device.deviceId)));
+            }}
+            disabled={loadingDevices}
+          >
+            Tout selectionner
+          </button>
+        </div>
+
+        <section className="section-grid section-grid--two">
+          <div className="card">
+            <div className="section-head">
+              <div>
+                <span className="mono-label">Video Inputs</span>
+                <h3>Sources video disponibles</h3>
+                <p>Selectionnez les cameras que la regie pourra retrouver dans son mur de sources.</p>
+              </div>
+              <span className="soft-chip">
+                <strong>{videoDevices.length}</strong> detectees
+              </span>
+            </div>
+
+            <div className="catalog-list">
+              {loadingDevices && <div className="empty-panel">Chargement des cameras...</div>}
+              {!loadingDevices && videoDevices.length === 0 && (
+                <div className="empty-panel">Aucune camera detectee sur cette station.</div>
+              )}
+              {videoDevices.map((device, index) => {
+                const live = liveVideoIds.has(device.deviceId);
+                const picked = pickedVideoDevices.has(device.deviceId);
+                return (
+                  <label key={device.deviceId} className="catalog-item">
+                    <input
+                      type="checkbox"
+                      checked={live || picked}
+                      disabled={live}
+                      onChange={() => togglePicked(device.deviceId, 'video')}
+                    />
+                    <div>
+                      <div className="catalog-item__name">{getVideoLabel(device, index)}</div>
+                      <div className="catalog-item__meta">Source camera prete pour le direct</div>
+                    </div>
+                    <span className={`catalog-badge ${live ? 'catalog-badge--live' : ''}`}>
+                      {live ? 'LIVE' : 'READY'}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+
+            <div className="action-row" style={{ marginTop: '1rem' }}>
+              <button
+                type="button"
+                onClick={launchSelectedVideos}
+                disabled={loadingDevices || pickedVideoDevices.size === 0 || !sessionId}
+              >
+                Publier la video
+              </button>
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="section-head">
+              <div>
+                <span className="mono-label">Audio Inputs</span>
+                <h3>Sources audio disponibles</h3>
+                <p>Les micros suivent un pipeline dedie pour que le son ne ralentisse jamais la video.</p>
+              </div>
+              <span className="soft-chip">
+                <strong>{audioDevices.length}</strong> detectees
+              </span>
+            </div>
+
+            <div className="catalog-list">
+              {loadingDevices && <div className="empty-panel">Chargement des micros...</div>}
+              {!loadingDevices && audioDevices.length === 0 && (
+                <div className="empty-panel">Aucune source audio detectee sur cette station.</div>
+              )}
+              {audioDevices.map((device, index) => {
+                const live = liveAudioIds.has(device.deviceId);
+                const picked = pickedAudioDevices.has(device.deviceId);
+                return (
+                  <label key={device.deviceId} className="catalog-item">
+                    <input
+                      type="checkbox"
+                      checked={live || picked}
+                      disabled={live}
+                      onChange={() => togglePicked(device.deviceId, 'audio')}
+                    />
+                    <div>
+                      <div className="catalog-item__name">{getAudioLabel(device, index)}</div>
+                      <div className="catalog-item__meta">Bus audio independant, optimisé pour le live</div>
+                    </div>
+                    <span className={`catalog-badge ${live ? 'catalog-badge--audio' : ''}`}>
+                      {live ? 'LIVE' : 'READY'}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+
+            <div className="action-row" style={{ marginTop: '1rem' }}>
+              <button
+                type="button"
+                className="button-audio"
+                onClick={launchSelectedAudios}
+                disabled={loadingDevices || pickedAudioDevices.size === 0 || !sessionId}
+              >
+                Publier l'audio
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="section-head">
+            <div>
+              <span className="mono-label">Published Sources</span>
+              <h3>Flux actuellement disponibles pour la regie</h3>
+              <p>Chaque source publiee devient une entree exploitable par le compte regie central.</p>
+            </div>
+            <span className="soft-chip">
+              <strong>{liveVideoSources.length + liveAudioSources.length}</strong> streams actifs
+            </span>
+          </div>
+
+          {liveVideoSources.length === 0 && liveAudioSources.length === 0 ? (
+            <div className="empty-panel">
+              Aucune source publiee pour le moment. Selectionnez vos cameras ou micros pour alimenter la plateforme.
+            </div>
+          ) : (
+            <div className="publisher-grid">
+              {liveVideoSources.map((source) => (
+                <LiveSourceCard
+                  key={`video-${source.deviceId}`}
+                  deviceId={source.deviceId}
+                  label={source.label}
+                  sessionId={sessionId}
+                  onStopped={stopVideoSource}
+                />
+              ))}
+              {liveAudioSources.map((source) => (
+                <LiveAudioCard
+                  key={`audio-${source.deviceId}`}
+                  deviceId={source.deviceId}
+                  label={source.label}
+                  sessionId={sessionId}
+                  onStopped={stopAudioSource}
+                />
+              ))}
+            </div>
+          )}
+        </section>
       </div>
     </div>
   );

@@ -1,0 +1,17 @@
+[Unit]
+Description=__APP_NAME__ Django Daphne backend
+After=network.target
+
+[Service]
+Type=simple
+User=__DEPLOY_USER__
+Group=__DEPLOY_GROUP__
+WorkingDirectory=__APP_DIR__/backend
+EnvironmentFile=__APP_DIR__/deploy/vps/backend.env
+ExecStart=__APP_DIR__/backend/venv/bin/python __APP_DIR__/backend/run_daphne.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

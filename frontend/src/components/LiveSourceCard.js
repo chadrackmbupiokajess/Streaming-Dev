@@ -1,169 +1,254 @@
 import React, { useEffect, useRef, useState } from 'react';
-import axios from 'axios';
-import { STREAM_CONFIG } from '../utils/stream';
+import { useAuth } from '../auth/AuthContext';
+import { API_URL, WEBRTC_VIDEO_CONFIG, buildWsUrl } from '../config';
+import apiClient from '../lib/apiClient';
+import {
+  createVideoPeerConnection,
+  preferRealtimeCodecs,
+  tuneVideoSender,
+} from '../utils/webrtc';
 
-const API_URL = 'http://localhost:8001/api';
-const WS_URL = 'ws://localhost:8001/ws';
-const { width, height, jpegQuality, maxBufferedBytes } = STREAM_CONFIG;
-
-async function getMediaStream(deviceId) {
-  const baseVideo = {
-    width: { ideal: 1280 },
-    height: { ideal: 720 },
-    frameRate: { ideal: 30, max: 30 },
-  };
-
-  const tryGet = (useExact) =>
+async function getVideoStream(videoDeviceId) {
+  const requestMedia = (exact) =>
     navigator.mediaDevices.getUserMedia({
       audio: false,
       video: {
-        ...baseVideo,
-        deviceId: useExact ? { exact: deviceId } : { ideal: deviceId },
+        width: { ideal: WEBRTC_VIDEO_CONFIG.width },
+        height: { ideal: WEBRTC_VIDEO_CONFIG.height },
+        frameRate: {
+          ideal: WEBRTC_VIDEO_CONFIG.frameRate,
+          max: WEBRTC_VIDEO_CONFIG.frameRate,
+        },
+        deviceId: exact ? { exact: videoDeviceId } : { ideal: videoDeviceId },
       },
     });
 
   try {
-    return await tryGet(true);
+    return await requestMedia(true);
   } catch {
-    return tryGet(false);
+    return requestMedia(false);
   }
 }
 
 function LiveSourceCard({ deviceId, label, sessionId, onStopped }) {
+  const { token } = useAuth();
   const videoRef = useRef(null);
-  const canvasRef = useRef(null);
-  const wsRef = useRef(null);
   const mediaStreamRef = useRef(null);
-  const streamingRef = useRef(false);
-  const encodingRef = useRef(false);
-  const [status, setStatus] = useState('Démarrage…');
+  const signalSocketRef = useRef(null);
+  const peersRef = useRef(new Map());
+  const pendingIceRef = useRef(new Map());
+  const [status, setStatus] = useState('Initialisation...');
+  const [viewerCount, setViewerCount] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
+    const backendDeviceId = `${sessionId}__${deviceId}`;
 
-    const cleanup = () => {
-      streamingRef.current = false;
-      encodingRef.current = false;
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-        mediaStreamRef.current = null;
+    const refreshViewerCount = () => {
+      setViewerCount(peersRef.current.size);
+    };
+
+    const sendSignal = (payload) => {
+      if (signalSocketRef.current?.readyState === WebSocket.OPEN) {
+        signalSocketRef.current.send(JSON.stringify(payload));
       }
     };
 
-    const captureLoop = () => {
-      if (cancelled || !streamingRef.current || wsRef.current?.readyState !== WebSocket.OPEN) {
+    const closePeer = (viewerId) => {
+      const peer = peersRef.current.get(viewerId);
+      if (peer) {
+        peer.close();
+      }
+      peersRef.current.delete(viewerId);
+      pendingIceRef.current.delete(viewerId);
+      refreshViewerCount();
+    };
+
+    const closeAllPeers = () => {
+      peersRef.current.forEach((peer) => peer.close());
+      peersRef.current.clear();
+      pendingIceRef.current.clear();
+      refreshViewerCount();
+    };
+
+    const cleanup = () => {
+      closeAllPeers();
+
+      if (signalSocketRef.current) {
+        signalSocketRef.current.close();
+        signalSocketRef.current = null;
+      }
+
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+      }
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+    };
+
+    const flushPendingIce = async (viewerId, peer) => {
+      const candidates = pendingIceRef.current.get(viewerId) || [];
+      pendingIceRef.current.delete(viewerId);
+      for (const candidate of candidates) {
+        await peer.addIceCandidate(candidate).catch(() => {});
+      }
+    };
+
+    const createPeerForViewer = async (viewerId) => {
+      const stream = mediaStreamRef.current;
+      if (!stream || cancelled) {
         return;
       }
 
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-      if (!video || !canvas || video.readyState < 2 || video.videoWidth === 0) {
-        requestAnimationFrame(captureLoop);
-        return;
-      }
+      closePeer(viewerId);
 
-      if (encodingRef.current || wsRef.current.bufferedAmount > maxBufferedBytes) {
-        requestAnimationFrame(captureLoop);
-        return;
-      }
+      const peer = createVideoPeerConnection();
+      peersRef.current.set(viewerId, peer);
+      refreshViewerCount();
 
-      const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
-      encodingRef.current = true;
-      ctx.drawImage(video, 0, 0, width, height);
+      const tuningTasks = [];
 
-      canvas.toBlob(
-        (blob) => {
-          encodingRef.current = false;
-          if (blob && wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(blob);
-          }
-          if (!cancelled && streamingRef.current) {
-            requestAnimationFrame(captureLoop);
-          }
-        },
-        'image/jpeg',
-        jpegQuality
-      );
+      stream.getVideoTracks().forEach((track) => {
+        track.contentHint = 'motion';
+        const transceiver = peer.addTransceiver(track, {
+          direction: 'sendonly',
+          streams: [stream],
+        });
+        preferRealtimeCodecs(transceiver);
+        tuningTasks.push(tuneVideoSender(transceiver.sender));
+      });
+
+      await Promise.allSettled(tuningTasks);
+
+      peer.onicecandidate = (event) => {
+        if (!event.candidate) {
+          return;
+        }
+        sendSignal({
+          type: 'webrtc_ice',
+          target_id: viewerId,
+          candidate: event.candidate,
+        });
+      };
+
+      peer.onconnectionstatechange = () => {
+        if (
+          peer.connectionState === 'failed' ||
+          peer.connectionState === 'closed' ||
+          peer.connectionState === 'disconnected'
+        ) {
+          closePeer(viewerId);
+        }
+      };
+
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      sendSignal({
+        type: 'webrtc_offer',
+        target_id: viewerId,
+        sdp: peer.localDescription.sdp,
+      });
     };
 
     const start = async () => {
       try {
-        const stream = await getMediaStream(deviceId);
+        const stream = await getVideoStream(deviceId);
         if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
+          stream.getTracks().forEach((track) => track.stop());
           return;
         }
 
         mediaStreamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(() => {});
         }
 
-        const backendDeviceId = `${sessionId}__${deviceId}`;
-        const streamName = (label || 'Source').slice(0, 80);
+        const response = await apiClient.post(`${API_URL}/cameras/register_source/`, {
+          name: (label || 'Source video').slice(0, 80),
+          device_id: backendDeviceId,
+        });
+        const cameraId = response.data.camera.id;
 
-        // Ancienne entrée (un seul device_id = session) → désactiver
-        try {
-          const all = await axios.get(`${API_URL}/cameras/`);
-          const legacy = all.data.find(
-            (c) => c.device_id === sessionId && c.is_active
-          );
-          if (legacy) {
-            await axios.post(`${API_URL}/cameras/${legacy.id}/deactivate/`);
+        if (cancelled) {
+          return;
+        }
+
+        const signalSocket = new WebSocket(buildWsUrl(`/stream/${cameraId}/`, token));
+        signalSocketRef.current = signalSocket;
+
+        signalSocket.onopen = () => {
+          if (cancelled) {
+            return;
           }
-        } catch {
-          /* ignore */
-        }
-
-        let cameraId;
-        try {
-          const res = await axios.post(`${API_URL}/cameras/`, {
-            name: streamName,
-            device_id: backendDeviceId,
+          setStatus(
+            `WebRTC HD ${WEBRTC_VIDEO_CONFIG.width}x${WEBRTC_VIDEO_CONFIG.height} / ${WEBRTC_VIDEO_CONFIG.frameRate} fps`
+          );
+          sendSignal({
+            type: 'webrtc_source_ready',
+            camera_id: cameraId,
           });
-          cameraId = res.data.id;
-        } catch (e) {
-          const list = await axios.get(`${API_URL}/cameras/`);
-          const existing = list.data.find((c) => c.device_id === backendDeviceId);
-          if (!existing) throw e;
-          cameraId = existing.id;
-          await axios.patch(`${API_URL}/cameras/${cameraId}/`, {
-            name: streamName,
-            is_active: true,
-          });
-        }
-
-        await axios.post(`${API_URL}/cameras/${cameraId}/activate/`);
-
-        if (cancelled) return;
-
-        const canvas = canvasRef.current;
-        canvas.width = width;
-        canvas.height = height;
-
-        const ws = new WebSocket(`${WS_URL}/stream/${cameraId}/`);
-        ws.binaryType = 'arraybuffer';
-        wsRef.current = ws;
-
-        ws.onopen = () => {
-          if (cancelled) return;
-          setStatus('En direct');
-          streamingRef.current = true;
-          captureLoop();
         };
 
-        ws.onclose = () => {
-          streamingRef.current = false;
-          if (!cancelled) setStatus('Déconnecté');
+        signalSocket.onmessage = (event) => {
+          const handleMessage = async () => {
+            const data = JSON.parse(event.data);
+
+            if (data.type === 'webrtc_viewer_ready' && data.viewer_id) {
+              await createPeerForViewer(data.viewer_id);
+              return;
+            }
+
+            if (data.type === 'webrtc_answer' && data.sender_id && data.sdp) {
+              const peer = peersRef.current.get(data.sender_id);
+              if (!peer) {
+                return;
+              }
+              await peer.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+              await flushPendingIce(data.sender_id, peer);
+              return;
+            }
+
+            if (data.type === 'webrtc_ice' && data.sender_id && data.candidate) {
+              const peer = peersRef.current.get(data.sender_id);
+              if (!peer) {
+                return;
+              }
+              if (!peer.remoteDescription) {
+                const queue = pendingIceRef.current.get(data.sender_id) || [];
+                queue.push(data.candidate);
+                pendingIceRef.current.set(data.sender_id, queue);
+                return;
+              }
+              await peer.addIceCandidate(data.candidate).catch(() => {});
+              return;
+            }
+
+            if (data.type === 'webrtc_peer_left' && data.peer_id) {
+              closePeer(data.peer_id);
+            }
+          };
+
+          handleMessage().catch(() => {
+            setStatus('Erreur signal WebRTC');
+          });
         };
 
-        ws.onerror = () => setStatus('Erreur WebSocket');
-      } catch (err) {
-        console.error(err);
+        signalSocket.onclose = () => {
+          closeAllPeers();
+          if (!cancelled) {
+            setStatus('Video WebRTC deconnectee');
+          }
+        };
+
+        signalSocket.onerror = () => {
+          setStatus('Erreur WebSocket signal');
+        };
+      } catch (error) {
+        console.error(error);
         if (!cancelled) {
           setStatus('Erreur');
           onStopped(deviceId);
@@ -175,66 +260,68 @@ function LiveSourceCard({ deviceId, label, sessionId, onStopped }) {
 
     return () => {
       cancelled = true;
-      const ws = wsRef.current;
-      const backendDeviceId = `${sessionId}__${deviceId}`;
       cleanup();
-      axios
-        .get(`${API_URL}/cameras/`)
-        .then((res) => {
-          const cam = res.data.find((c) => c.device_id === backendDeviceId);
-          if (cam) {
-            return axios.post(`${API_URL}/cameras/${cam.id}/deactivate/`);
-          }
+      apiClient
+        .post(`${API_URL}/cameras/deactivate_source/`, {
+          device_id: backendDeviceId,
         })
         .catch(() => {});
     };
-  }, [deviceId, label, sessionId, onStopped]);
-
-  const handleStop = () => {
-    onStopped(deviceId);
-  };
+  }, [deviceId, label, onStopped, sessionId, token]);
 
   return (
     <div
-      className="card"
-      style={{ padding: '12px', textAlign: 'center', border: '2px solid #27ae60' }}
+      className="card video-card"
+      style={{
+        padding: '1rem',
+        textAlign: 'center',
+        border: '1px solid rgba(56, 216, 132, 0.22)',
+      }}
     >
       <div
         style={{
           display: 'flex',
           justifyContent: 'space-between',
           alignItems: 'center',
+          gap: '0.8rem',
           marginBottom: '8px',
           fontSize: '0.9rem',
         }}
       >
         <strong style={{ textAlign: 'left' }}>{label}</strong>
-        <span style={{ color: '#27ae60', fontSize: '0.75rem' }}>{status}</span>
+        <span style={{ color: '#27ae60', fontSize: '0.75rem' }}>
+          {status} | {viewerCount} receiver
+        </span>
       </div>
+
       <video
         ref={videoRef}
         autoPlay
         playsInline
         muted
-        style={{ width: '100%', background: '#000', borderRadius: '8px', maxHeight: '200px' }}
+        style={{
+          background: '#000',
+          borderRadius: '18px',
+          maxHeight: '220px',
+          width: '100%',
+        }}
       />
-      <canvas ref={canvasRef} style={{ display: 'none' }} />
       <button
         type="button"
-        onClick={handleStop}
+        onClick={() => onStopped(deviceId)}
         style={{
           width: '100%',
           marginTop: '10px',
-          padding: '8px',
+          padding: '0.85rem',
           background: '#e74c3c',
           color: 'white',
           border: 'none',
-          borderRadius: '6px',
+          borderRadius: '999px',
           cursor: 'pointer',
           fontWeight: 'bold',
         }}
       >
-        Arrêter cette source
+        Arreter cette source video
       </button>
     </div>
   );
