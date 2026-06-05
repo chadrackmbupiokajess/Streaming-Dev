@@ -16,11 +16,6 @@ if [[ -z "${TURN_PASSWORD}" ]]; then
     exit 1
 fi
 
-if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
-    echo "TLS certificate for ${DOMAIN} is missing. Run certbot first."
-    exit 1
-fi
-
 if ! command -v turnserver >/dev/null 2>&1; then
     sudo apt-get update
     sudo apt-get install -y coturn
@@ -37,12 +32,8 @@ if [[ -f /etc/default/coturn ]]; then
     sudo sed -i 's/^TURNSERVER_ENABLED=.*/TURNSERVER_ENABLED=1/' /etc/default/coturn
 fi
 
-sudo touch /var/log/turnserver.log
-sudo chown turnserver:turnserver /var/log/turnserver.log || true
-
 sudo ufw allow 3478/tcp
 sudo ufw allow 3478/udp
-sudo ufw allow 5349/tcp
 sudo ufw allow 49160:49200/udp
 
 sudo systemctl enable coturn

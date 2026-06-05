@@ -1,5 +1,4 @@
 listening-port=3478
-tls-listening-port=5349
 
 listening-ip=0.0.0.0
 external-ip=__PUBLIC_IP__
@@ -13,11 +12,6 @@ realm=__DOMAIN__
 server-name=__DOMAIN__
 user=__TURN_USER__:__TURN_PASSWORD__
 
-cert=/etc/letsencrypt/live/__DOMAIN__/fullchain.pem
-pkey=/etc/letsencrypt/live/__DOMAIN__/privkey.pem
-
 no-cli
 no-multicast-peers
 stale-nonce
-log-file=/var/log/turnserver.log
-simple-log

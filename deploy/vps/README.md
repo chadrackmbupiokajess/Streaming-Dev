@@ -110,7 +110,7 @@ If the UI shows the source but the image stays on statuses such as
 
 ### Install coturn on the VPS
 
-After HTTPS is already active:
+Install coturn:
 
 ```bash
 cd /srv/streaming-dev
@@ -126,7 +126,7 @@ deploy/vps/setup_coturn.sh
 Then update `/srv/streaming-dev/deploy/vps/frontend.env`:
 
 ```env
-REACT_APP_WEBRTC_ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":["turn:stream.bisofood.com:3478?transport=udp","turn:stream.bisofood.com:3478?transport=tcp","turns:stream.bisofood.com:5349?transport=tcp"],"username":"streamturn","credential":"change-me-with-a-strong-password"}]
+REACT_APP_WEBRTC_ICE_SERVERS='[{"urls":"stun:stun.l.google.com:19302"},{"urls":["turn:stream.bisofood.com:3478?transport=udp","turn:stream.bisofood.com:3478?transport=tcp"],"username":"streamturn","credential":"change-me-with-a-strong-password"}]'
 ```
 
 Then redeploy:
